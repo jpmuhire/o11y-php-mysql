@@ -1,0 +1,136 @@
+#cloud-config
+package_update: true
+package_upgrade: false
+packages:
+  - apache2
+  - php
+  - php-mysql
+  - php-cli
+  - php-dev
+  - php-xml
+  - libapache2-mod-php
+  - mysql-client
+  - curl
+  - ca-certificates
+  - gnupg
+  - unzip
+
+write_files:
+  - path: /etc/apache2/mods-available/status.conf
+    permissions: '0644'
+    content: |
+      <IfModule mod_status.c>
+        ExtendedStatus On
+        <Location /server-status>
+          SetHandler server-status
+          Require local
+        </Location>
+      </IfModule>
+
+  - path: /etc/apache2/conf-available/servername.conf
+    permissions: '0644'
+    content: |
+      ServerName localhost
+
+  - path: /var/www/html/index.php
+    permissions: '0644'
+    content: |
+__INDEX_PHP__
+
+  - path: /etc/apache2/conf-available/app-env.conf
+    permissions: '0644'
+    content: |
+      SetEnv DB_HOST __MYSQL_IP__
+      SetEnv DB_NAME appdb
+      SetEnv DB_USER appuser
+      SetEnv DB_PASS __APP_PWD__
+
+  - path: /etc/otel/collector/custom-config.yaml
+    permissions: '0644'
+    content: |
+      extensions:
+        health_check:
+          endpoint: 0.0.0.0:13133
+      receivers:
+        hostmetrics:
+          collection_interval: 30s
+          scrapers:
+            cpu: {}
+            disk: {}
+            filesystem: {}
+            load: {}
+            memory: {}
+            network: {}
+            paging: {}
+            processes: {}
+        apache:
+          endpoint: http://localhost:80/server-status?auto
+          collection_interval: 30s
+        otlp:
+          protocols:
+            grpc:
+              endpoint: 0.0.0.0:4317
+            http:
+              endpoint: 0.0.0.0:4318
+      processors:
+        batch: {}
+        resourcedetection:
+          detectors: [system, env, azure]
+          override: false
+        resource/host:
+          attributes:
+            - key: deployment.environment
+              value: demo-o11y-lamp
+              action: upsert
+      exporters:
+        signalfx:
+          access_token: ${SPLUNK_ACCESS_TOKEN}
+          realm: ${SPLUNK_REALM}
+          sync_host_metadata: true
+        otlphttp:
+          endpoint: https://ingest.${SPLUNK_REALM}.signalfx.com
+          headers:
+            X-SF-Token: ${SPLUNK_ACCESS_TOKEN}
+      service:
+        extensions: [health_check]
+        pipelines:
+          metrics:
+            receivers: [hostmetrics, apache]
+            processors: [resourcedetection, resource/host, batch]
+            exporters: [signalfx]
+          traces:
+            receivers: [otlp]
+            processors: [resourcedetection, resource/host, batch]
+            exporters: [otlphttp]
+
+runcmd:
+  - rm -f /var/www/html/index.html
+  - a2enmod status
+  - a2enconf servername app-env
+  - systemctl restart apache2
+  - curl -sSL https://dl.signalfx.com/splunk-otel-collector.sh -o /tmp/otel.sh
+  - sh /tmp/otel.sh --realm __REALM__ --mode agent --without-instrumentation __TOKEN__
+  - sed -i 's|^SPLUNK_CONFIG=.*|SPLUNK_CONFIG=/etc/otel/collector/custom-config.yaml|' /etc/otel/collector/splunk-otel-collector.conf
+  - grep -q '^SPLUNK_CONFIG=' /etc/otel/collector/splunk-otel-collector.conf || echo 'SPLUNK_CONFIG=/etc/otel/collector/custom-config.yaml' >> /etc/otel/collector/splunk-otel-collector.conf
+  - systemctl restart splunk-otel-collector
+  # Splunk Distribution of OpenTelemetry PHP (auto-instrumentation)
+  - curl -sSL https://github.com/signalfx/splunk-otel-php/releases/latest/download/install.sh -o /tmp/splunk-otel-php-install.sh
+  - bash /tmp/splunk-otel-php-install.sh || true
+  - |
+    cat > /etc/php/8.1/mods-available/splunk-otel.ini <<'EOF'
+    extension=opentelemetry.so
+    EOF
+  - phpenmod -v 8.1 splunk-otel || true
+  - |
+    cat > /etc/apache2/conf-available/splunk-otel-env.conf <<EOF
+    SetEnv OTEL_SERVICE_NAME php-lamp-demo
+    SetEnv OTEL_RESOURCE_ATTRIBUTES deployment.environment=demo-o11y-lamp,service.version=1.0.0
+    SetEnv OTEL_EXPORTER_OTLP_ENDPOINT http://127.0.0.1:4318
+    SetEnv OTEL_EXPORTER_OTLP_PROTOCOL http/protobuf
+    SetEnv OTEL_PHP_AUTOLOAD_ENABLED true
+    SetEnv OTEL_TRACES_EXPORTER otlp
+    SetEnv OTEL_METRICS_EXPORTER otlp
+    SetEnv OTEL_LOGS_EXPORTER otlp
+    EOF
+  - a2enconf splunk-otel-env
+  - systemctl restart apache2
