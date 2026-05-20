@@ -250,3 +250,276 @@ otelcol_exporter_sent_spans{exporter="otlphttp/traces",url_path="/v2/trace/otlp"
 - [Splunk: instrument PHP with OpenTelemetry](https://docs.splunk.com/observability/en/gdi/get-data-in/application/php/get-started.html)
 - [OpenTelemetry PHP contrib auto-instrumentation list](https://github.com/open-telemetry/opentelemetry-php-contrib)
 - [Splunk OpenTelemetry Collector configuration reference](https://github.com/signalfx/splunk-otel-collector)
+
+---
+
+## 7. Manual installation — step-by-step
+
+This is exactly what [fix-web.sh](../fix-web.sh) + [fix-php-root-span.sh](../fix-php-root-span.sh)
+did on `vm-web`, broken into manual commands you can run yourself.
+
+> Run all commands as a sudoer on the LAMP VM (Ubuntu 24.04, PHP 8.3,
+> Apache prefork + mod_php).
+
+### 7.0 Variables you'll reuse
+
+```bash
+export SPLUNK_REALM="eu1"
+export SPLUNK_ACCESS_TOKEN="<your-token>"
+export SERVICE_NAME="php-lamp-demo"
+export DEPLOY_ENV="demo-o11y-lamp"
+```
+
+### 7.1 Install build prerequisites for the PECL extension
+
+The OTel SDK alone is not enough; it needs a native PHP extension to hook the
+Zend engine.
+
+```bash
+sudo apt-get update
+sudo apt-get install -y \
+  php-cli php-dev php-pear php-mysql php-curl php-mbstring php-xml php-zip \
+  build-essential pkg-config autoconf gcc make unzip curl
+```
+
+### 7.2 Install the Splunk OTel Collector (local OTLP receiver)
+
+The PHP SDK ships spans to `127.0.0.1:4318`; the collector forwards them to
+Splunk APM.
+
+```bash
+curl -sSL https://dl.signalfx.com/splunk-otel-collector.sh > /tmp/splunk-otel-collector.sh
+sudo sh /tmp/splunk-otel-collector.sh \
+  --realm "$SPLUNK_REALM" \
+  --mode agent \
+  --collector-config /etc/otel/collector/custom-config.yaml \
+  -- "$SPLUNK_ACCESS_TOKEN" || true
+sudo systemctl stop splunk-otel-collector
+```
+
+(The installer auto-starts the service; we stop it because we'll write our own
+config in step 7.6.)
+
+### 7.3 Install the PECL `opentelemetry` extension
+
+```bash
+sudo pecl channel-update pecl.php.net
+printf "\n" | sudo pecl install opentelemetry          # accept defaults
+echo "extension=opentelemetry.so" | sudo tee /etc/php/8.3/mods-available/opentelemetry.ini
+sudo phpenmod -v 8.3 -s ALL opentelemetry              # enable for BOTH cli and apache2 SAPI
+sudo systemctl reload apache2
+
+# Verify
+php -m | grep opentelemetry
+sudo -u www-data php -r 'echo extension_loaded("opentelemetry") ? "OK\n" : "MISSING\n";'
+```
+
+> **Pitfall:** if you only edit `php.ini` you'll enable it for CLI but **not**
+> Apache. Always use `phpenmod`.
+
+### 7.4 Install Composer + the OpenTelemetry SDK in the web root
+
+```bash
+# Composer
+curl -sS https://getcomposer.org/installer | sudo php -- --install-dir=/usr/local/bin --filename=composer
+
+# SDK + auto-instrumentation packages
+cd /var/www/html
+sudo composer require --no-interaction \
+  open-telemetry/sdk \
+  open-telemetry/exporter-otlp \
+  open-telemetry/opentelemetry-auto-pdo \
+  open-telemetry/opentelemetry-auto-slim
+sudo chown -R www-data:www-data /var/www/html/vendor /var/www/html/composer.*
+```
+
+What each package does:
+
+| Package | Purpose |
+|---|---|
+| `open-telemetry/sdk` | TracerProvider, span processor, context propagation |
+| `open-telemetry/exporter-otlp` | Sends spans to local collector over OTLP/HTTP |
+| `opentelemetry-auto-pdo` | Wraps every PDO call as a child DB span |
+| `opentelemetry-auto-slim` | Only useful if you're using the Slim framework |
+
+### 7.5 Bootstrap file + Apache env vars
+
+#### 7.5a Root-span bootstrap (`/var/www/html/_otel_bootstrap.php`)
+
+Plain PHP+Apache has no community auto-instrumentation for incoming HTTP
+requests — you must create the SERVER root span yourself.
+
+```bash
+sudo tee /var/www/html/_otel_bootstrap.php >/dev/null <<'PHP'
+<?php
+require_once '/var/www/html/vendor/autoload.php';
+if (PHP_SAPI === 'cli') { return; }
+
+use OpenTelemetry\API\Globals;
+use OpenTelemetry\API\Trace\SpanKind;
+use OpenTelemetry\API\Trace\StatusCode;
+
+try {
+    $tracer = Globals::tracerProvider()->getTracer('php.apache.request');
+    $method = $_SERVER['REQUEST_METHOD'] ?? 'GET';
+    $route  = strtok($_SERVER['REQUEST_URI'] ?? '/', '?');
+
+    $span = $tracer->spanBuilder("$method $route")
+        ->setSpanKind(SpanKind::KIND_SERVER)
+        ->startSpan();
+    $span->setAttribute('http.request.method', $method);
+    $span->setAttribute('url.path',            $_SERVER['REQUEST_URI'] ?? '/');
+    $span->setAttribute('url.scheme',          empty($_SERVER['HTTPS']) ? 'http' : 'https');
+    $span->setAttribute('server.address',      $_SERVER['HTTP_HOST']   ?? '');
+    $span->setAttribute('client.address',      $_SERVER['REMOTE_ADDR'] ?? '');
+    $scope = $span->activate();
+
+    register_shutdown_function(static function () use ($span, $scope) {
+        $code = http_response_code() ?: 200;
+        $span->setAttribute('http.response.status_code', $code);
+        if ($code >= 500) { $span->setStatus(StatusCode::STATUS_ERROR); }
+        $scope->detach();
+        $span->end();
+    });
+} catch (\Throwable $e) { error_log('[otel-bootstrap] '.$e->getMessage()); }
+PHP
+sudo chmod 644 /var/www/html/_otel_bootstrap.php
+```
+
+#### 7.5b Wire it as `auto_prepend_file` for the Apache SAPI
+
+```bash
+sudo tee /etc/php/8.3/apache2/conf.d/99-otel.ini >/dev/null <<'INI'
+auto_prepend_file = /var/www/html/_otel_bootstrap.php
+INI
+```
+
+#### 7.5c Pass OTEL_* env vars to mod_php via Apache `SetEnv`
+
+```bash
+sudo tee /etc/apache2/conf-available/splunk-otel-env.conf >/dev/null <<EOF
+SetEnv OTEL_PHP_AUTOLOAD_ENABLED   true
+SetEnv OTEL_SERVICE_NAME           ${SERVICE_NAME}
+SetEnv OTEL_RESOURCE_ATTRIBUTES    deployment.environment=${DEPLOY_ENV},service.version=1.0.0
+SetEnv OTEL_TRACES_EXPORTER        otlp
+SetEnv OTEL_METRICS_EXPORTER       none
+SetEnv OTEL_LOGS_EXPORTER          none
+SetEnv OTEL_EXPORTER_OTLP_PROTOCOL http/protobuf
+SetEnv OTEL_EXPORTER_OTLP_ENDPOINT http://127.0.0.1:4318
+SetEnv OTEL_PROPAGATORS            baggage,tracecontext
+EOF
+
+sudo a2enconf splunk-otel-env
+sudo systemctl reload apache2
+```
+
+> **Critical:** `OTEL_PHP_AUTOLOAD_ENABLED=true` is what makes auto-pdo
+> register itself the moment `vendor/autoload.php` is loaded.
+
+### 7.6 Collector config (OTLP receiver → Splunk APM)
+
+```bash
+sudo tee /etc/otel/collector/custom-config.yaml >/dev/null <<EOF
+extensions:
+  health_check: { endpoint: 0.0.0.0:13133 }
+
+receivers:
+  otlp:
+    protocols:
+      grpc: { endpoint: 0.0.0.0:4317 }
+      http: { endpoint: 0.0.0.0:4318 }
+  hostmetrics:
+    collection_interval: 30s
+    scrapers: { cpu: {}, disk: {}, filesystem: {}, load: {}, memory: {}, network: {}, paging: {}, processes: {} }
+  apache:
+    endpoint: http://localhost:80/server-status?auto
+    collection_interval: 30s
+
+processors:
+  batch: {}
+  resourcedetection:
+    detectors: [system, env, azure]
+    override: false
+  # Force host.name to the short Azure VM name so APM<->Infra correlation works.
+  resource/normalize_host:
+    attributes:
+      - { key: host.name, from_attribute: azure.vm.name, action: upsert }
+  resource/host:
+    attributes:
+      - { key: deployment.environment, value: ${DEPLOY_ENV}, action: upsert }
+
+exporters:
+  signalfx:
+    access_token: "\${SPLUNK_ACCESS_TOKEN}"
+    realm:        "\${SPLUNK_REALM}"
+    sync_host_metadata: true
+  # Splunk APM trace ingest path — NOT the root signalfx URL!
+  otlphttp/traces:
+    traces_endpoint: "https://ingest.\${SPLUNK_REALM}.signalfx.com/v2/trace/otlp"
+    headers:
+      X-SF-Token: "\${SPLUNK_ACCESS_TOKEN}"
+
+service:
+  extensions: [health_check]
+  pipelines:
+    metrics:
+      receivers:  [hostmetrics, apache]
+      processors: [resourcedetection, resource/normalize_host, resource/host, batch]
+      exporters:  [signalfx]
+    traces:
+      receivers:  [otlp]
+      processors: [resourcedetection, resource/normalize_host, resource/host, batch]
+      exporters:  [otlphttp/traces]
+EOF
+
+# Ensure realm + token are in the service env file
+sudo sed -i \
+  -e "s|^SPLUNK_REALM=.*|SPLUNK_REALM=${SPLUNK_REALM}|" \
+  -e "s|^SPLUNK_ACCESS_TOKEN=.*|SPLUNK_ACCESS_TOKEN=${SPLUNK_ACCESS_TOKEN}|" \
+  /etc/otel/collector/splunk-otel-collector.conf
+
+sudo systemctl restart splunk-otel-collector
+sudo systemctl status splunk-otel-collector --no-pager | head -6
+```
+
+### 7.7 Smoke test
+
+```bash
+# Make a request
+curl -X POST -d "name=Test&email=t@x.io&message=hi" http://127.0.0.1/
+
+# Collector internal counters — both numbers should be equal and > 0
+curl -s http://127.0.0.1:8888/metrics | grep -E 'otelcol_(receiver_accepted|exporter_sent)_spans'
+
+# Health check
+curl -s http://127.0.0.1:13133/ ; echo
+
+# Should be no failures
+curl -s http://127.0.0.1:8888/metrics | grep exporter_send_failed_spans || echo "no failures"
+```
+
+Healthy output:
+
+```
+otelcol_receiver_accepted_spans{receiver="otlp",transport="http"}                                 6
+otelcol_exporter_sent_spans{exporter="otlphttp/traces",url_path="/v2/trace/otlp"}                 6
+{"status":"Server available"}
+no failures
+```
+
+Then in **Splunk Observability → APM → Services**, look for `php-lamp-demo`
+(env `demo-o11y-lamp`) — spans appear within ~30 s.
+
+### 7.8 What each step accomplishes
+
+| Step | What it produces |
+|---|---|
+| 7.1 | Compiler + headers so PECL can build a native PHP extension |
+| 7.2 | Local OTel agent listening on `:4318` (OTLP/HTTP) and `:8888` (Prometheus self-metrics) |
+| 7.3 | `opentelemetry.so` loaded in **both** CLI and Apache SAPIs — the hook engine |
+| 7.4 | SDK + auto-PDO instrumentation available to PHP via Composer autoload |
+| 7.5 | Every Apache request: env vars set → bootstrap runs → SERVER span created → PDO calls become child spans → span flushed on shutdown |
+| 7.6 | Collector forwards spans to Splunk APM `/v2/trace/otlp` and normalizes `host.name` so APM-Infra correlation works |
+| 7.7 | End-to-end verified by lockstep counter increments |
+
+If anything fails, jump back to §5 *Common pitfalls*.
