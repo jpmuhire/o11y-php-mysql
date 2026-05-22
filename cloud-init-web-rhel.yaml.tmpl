@@ -1,0 +1,223 @@
+#cloud-config
+# RHEL 9 LAMP cloud-init for the o11y_php_mysql project.
+#
+# Installs Apache (httpd), PHP 8.2 (via AppStream module), MySQL client,
+# Composer + OpenTelemetry PHP SDK + auto-pdo, PECL opentelemetry C extension,
+# and the Splunk OTel Collector wired to scrape Apache + accept OTLP traces
+# and forward them to Splunk APM.
+#
+# Templated tokens (replaced by deploy script):
+#   APP_PWD    - app DB password (URL-safe alnum)
+#   MYSQL_IP   - private IP of the MySQL VM
+#   REALM      - Splunk realm (e.g. eu1)
+#   TOKEN      - Splunk access token
+#   INDEX_PHP  - the app/index.php content
+
+package_update: true
+package_upgrade: false
+
+write_files:
+  - path: /var/www/html/index.php
+    permissions: '0644'
+    content: |
+__INDEX_PHP__
+
+  - path: /etc/httpd/conf.d/app-env.conf
+    permissions: '0644'
+    content: |
+      SetEnv DB_HOST __MYSQL_IP__
+      SetEnv DB_NAME appdb
+      SetEnv DB_USER appuser
+      SetEnv DB_PASS __APP_PWD__
+
+  - path: /etc/httpd/conf.d/server-status.conf
+    permissions: '0644'
+    content: |
+      ExtendedStatus On
+      <Location /server-status>
+        SetHandler server-status
+        Require local
+      </Location>
+
+  - path: /etc/httpd/conf.d/splunk-otel-env.conf
+    permissions: '0644'
+    content: |
+      SetEnv OTEL_PHP_AUTOLOAD_ENABLED   true
+      SetEnv OTEL_SERVICE_NAME           php-lamp-demo
+      SetEnv OTEL_RESOURCE_ATTRIBUTES    deployment.environment=demo-o11y-lamp,service.version=1.0.0
+      SetEnv OTEL_TRACES_EXPORTER        otlp
+      SetEnv OTEL_METRICS_EXPORTER       none
+      SetEnv OTEL_LOGS_EXPORTER          none
+      SetEnv OTEL_EXPORTER_OTLP_PROTOCOL http/protobuf
+      SetEnv OTEL_EXPORTER_OTLP_ENDPOINT http://127.0.0.1:4318
+      SetEnv OTEL_PROPAGATORS            baggage,tracecontext
+
+  - path: /var/www/html/_otel_bootstrap.php
+    permissions: '0644'
+    content: |
+      <?php
+      // Safe bootstrap: silently no-op if vendor not installed yet (e.g. during
+      // cloud-init before composer ran, or if composer is uninstalled).
+      $autoload = '/var/www/html/vendor/autoload.php';
+      if (!is_file($autoload) || PHP_SAPI === 'cli') {
+          return;
+      }
+      require_once $autoload;
+
+      use OpenTelemetry\API\Globals;
+      use OpenTelemetry\API\Trace\SpanKind;
+      use OpenTelemetry\API\Trace\StatusCode;
+
+      try {
+          $tracer = Globals::tracerProvider()->getTracer('php.apache.request');
+          $method = $_SERVER['REQUEST_METHOD'] ?? 'GET';
+          $route  = strtok($_SERVER['REQUEST_URI'] ?? '/', '?');
+
+          $span = $tracer->spanBuilder("$method $route")
+              ->setSpanKind(SpanKind::KIND_SERVER)
+              ->startSpan();
+          $span->setAttribute('http.request.method', $method);
+          $span->setAttribute('url.path',            $_SERVER['REQUEST_URI'] ?? '/');
+          $span->setAttribute('url.scheme',          empty($_SERVER['HTTPS']) ? 'http' : 'https');
+          $span->setAttribute('server.address',      $_SERVER['HTTP_HOST']   ?? '');
+          $span->setAttribute('client.address',      $_SERVER['REMOTE_ADDR'] ?? '');
+          $scope = $span->activate();
+
+          register_shutdown_function(static function () use ($span, $scope) {
+              $code = http_response_code() ?: 200;
+              $span->setAttribute('http.response.status_code', $code);
+              if ($code >= 500) { $span->setStatus(StatusCode::STATUS_ERROR); }
+              $scope->detach();
+              $span->end();
+          });
+      } catch (\Throwable $e) { error_log('[otel-bootstrap] '.$e->getMessage()); }
+
+  - path: /etc/php.d/99-otel.ini
+    permissions: '0644'
+    content: |
+      auto_prepend_file = /var/www/html/_otel_bootstrap.php
+
+  - path: /etc/otel/collector/custom-config.yaml
+    permissions: '0644'
+    content: |
+      extensions:
+        health_check: { endpoint: 0.0.0.0:13133 }
+      receivers:
+        hostmetrics:
+          collection_interval: 30s
+          scrapers: { cpu: {}, disk: {}, filesystem: {}, load: {}, memory: {}, network: {}, paging: {}, processes: {} }
+        apache:
+          endpoint: http://localhost:80/server-status?auto
+          collection_interval: 30s
+        otlp:
+          protocols:
+            grpc: { endpoint: 0.0.0.0:4317 }
+            http: { endpoint: 0.0.0.0:4318 }
+      processors:
+        batch: {}
+        resourcedetection:
+          detectors: [system, env, azure]
+          override: false
+        resource/normalize_host:
+          attributes:
+            - { key: host.name, from_attribute: azure.vm.name, action: upsert }
+        resource/host:
+          attributes:
+            - { key: deployment.environment, value: demo-o11y-lamp, action: upsert }
+      exporters:
+        signalfx:
+          access_token: "${SPLUNK_ACCESS_TOKEN}"
+          realm:        "${SPLUNK_REALM}"
+          sync_host_metadata: true
+        otlphttp/traces:
+          traces_endpoint: "https://ingest.${SPLUNK_REALM}.signalfx.com/v2/trace/otlp"
+          headers:
+            X-SF-Token: "${SPLUNK_ACCESS_TOKEN}"
+      service:
+        extensions: [health_check]
+        pipelines:
+          metrics:
+            receivers:  [hostmetrics, apache]
+            processors: [resourcedetection, resource/normalize_host, resource/host, batch]
+            exporters:  [signalfx]
+          traces:
+            receivers:  [otlp]
+            processors: [resourcedetection, resource/normalize_host, resource/host, batch]
+            exporters:  [otlphttp/traces]
+
+  - path: /usr/local/bin/setup-lamp-otel.sh
+    permissions: '0755'
+    content: |
+      #!/usr/bin/env bash
+      set -euxo pipefail
+
+      # -------- Packages --------
+      dnf -y install dnf-plugins-core
+      dnf -y module reset php
+      dnf -y module enable php:8.2
+      dnf -y install httpd mysql \
+        php php-cli php-mysqlnd php-xml php-mbstring php-pecl-zip \
+        php-devel php-pear \
+        gcc gcc-c++ make autoconf pkgconfig \
+        curl ca-certificates unzip jq
+
+      # -------- Firewall --------
+      systemctl enable --now firewalld || true
+      firewall-cmd --permanent --add-service=http
+      firewall-cmd --reload
+
+      # -------- SELinux booleans --------
+      # Allow Apache to read auto_prepend bootstrap and connect to remote MySQL + local OTLP.
+      setsebool -P httpd_can_network_connect 1
+      setsebool -P httpd_can_network_connect_db 1
+      # Bootstrap and vendor will be created under /var/www/html - restorecon at the end.
+
+      # -------- PECL opentelemetry extension --------
+      # Don't enable auto-load until SDK + .so are both in place.
+      mv -f /etc/php.d/99-otel.ini /tmp/99-otel.ini.pending || true
+
+      # pecl is interactive even with empty defaults; pipe yes-newlines to all prompts.
+      yes '' | pecl install opentelemetry
+      SOPATH=$(php-config --extension-dir)/opentelemetry.so
+      test -f "$SOPATH" || { echo "opentelemetry.so missing at $SOPATH"; exit 1; }
+      echo "extension=opentelemetry.so" > /etc/php.d/40-opentelemetry.ini
+
+      # -------- Composer + OTel SDK --------
+      curl -sS https://getcomposer.org/installer | php -- --install-dir=/usr/local/bin --filename=composer
+      cd /var/www/html
+      composer require --no-interaction \
+        open-telemetry/sdk \
+        open-telemetry/exporter-otlp \
+        open-telemetry/opentelemetry-auto-pdo \
+        open-telemetry/opentelemetry-auto-slim \
+        guzzlehttp/guzzle \
+        http-interop/http-factory-guzzle
+      chown -R apache:apache /var/www/html
+
+      # Re-enable the auto_prepend bootstrap now that vendor/ exists.
+      mv -f /tmp/99-otel.ini.pending /etc/php.d/99-otel.ini
+
+      # -------- SELinux contexts on the new files --------
+      restorecon -R /var/www/html /etc/php.d /etc/httpd/conf.d || true
+
+      # -------- Splunk OTel Collector --------
+      curl -sSL https://dl.signalfx.com/splunk-otel-collector.sh -o /tmp/otel.sh
+      sh /tmp/otel.sh --realm "__REALM__" --mode agent \
+        --collector-config /etc/otel/collector/custom-config.yaml \
+        -- "__TOKEN__" || true
+      sed -i "s|^SPLUNK_REALM=.*|SPLUNK_REALM=__REALM__|" /etc/otel/collector/splunk-otel-collector.conf || true
+      sed -i "s|^SPLUNK_ACCESS_TOKEN=.*|SPLUNK_ACCESS_TOKEN=__TOKEN__|" /etc/otel/collector/splunk-otel-collector.conf || true
+      systemctl restart splunk-otel-collector
+
+      # -------- Start Apache --------
+      systemctl enable --now httpd
+      rm -f /var/www/html/index.html
+      systemctl restart httpd
+
+      # -------- Smoke check --------
+      sleep 2
+      curl -fsS http://127.0.0.1/ -o /dev/null && echo "httpd OK"
+      curl -fsS http://127.0.0.1:13133/ ; echo
+
+runcmd:
+  - [ bash, -lc, "/usr/local/bin/setup-lamp-otel.sh >/var/log/setup-lamp-otel.log 2>&1" ]
